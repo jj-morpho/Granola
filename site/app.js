@@ -8,7 +8,7 @@
 (function () {
     "use strict";
 
-    const SUMMARIES_INDEX = "../summaries/index.json";
+    const SUMMARIES_INDEX = "summaries/index.json";
     const sidebar = document.getElementById("sidebar");
     const weekList = document.getElementById("week-list");
     const summaryEl = document.getElementById("summary");
@@ -88,7 +88,7 @@
         summaryEl.innerHTML = `<div class="loading-weeks" style="padding:40px 0">Loading summary...</div>`;
 
         try {
-            const resp = await fetch(`../summaries/${week.file}`);
+            const resp = await fetch(`summaries/${week.file}`);
             if (!resp.ok) throw new Error(`${resp.status}`);
             const data = await resp.json();
             renderSummary(data, week);
