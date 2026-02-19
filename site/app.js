@@ -1,252 +1,364 @@
 /**
- * Weekly Integrator Notes — Frontend
+ * Integrator Notes — Frontend
  *
- * Loads summary data from summaries/index.json, renders the sidebar week list,
- * and displays the selected week's summary (markdown rendered to HTML).
+ * Loads summary data from summaries/index.json, parses the markdown into
+ * structured sections, and renders them as actionable cards.
+ * Supports 7-day and 28-day rolling views via tabs.
  */
 
 (function () {
     "use strict";
 
     const SUMMARIES_INDEX = "summaries/index.json";
-    const sidebar = document.getElementById("sidebar");
-    const weekList = document.getElementById("week-list");
     const summaryEl = document.getElementById("summary");
     const headerMeta = document.getElementById("header-meta");
-    const menuToggle = document.getElementById("menu-toggle");
+    const tabBar = document.getElementById("tab-bar");
 
-    let weeks = [];
-    let overlay = null;
+    let allWeeks = [];   // sorted newest-first
+    let allSummaries = {}; // keyed by week_start
+    let activeTab = "7";
 
     // ── Bootstrap ──────────────────────────────────────────────
     async function init() {
-        createOverlay();
-        menuToggle.addEventListener("click", toggleSidebar);
+        tabBar.addEventListener("click", onTabClick);
 
         try {
             const resp = await fetch(SUMMARIES_INDEX);
-            if (!resp.ok) throw new Error(`${resp.status}`);
+            if (!resp.ok) throw new Error(resp.status);
             const data = await resp.json();
-            weeks = (data.weeks || []).sort(
+            allWeeks = (data.weeks || []).sort(
                 (a, b) => new Date(b.week_start) - new Date(a.week_start)
             );
         } catch (e) {
-            weekList.innerHTML = `<div class="loading-weeks">No summaries yet. Check back after Monday.</div>`;
+            summaryEl.innerHTML = '<div class="empty-state"><p>No summaries yet. Check back after Monday.</p></div>';
             return;
         }
 
-        if (weeks.length === 0) {
-            weekList.innerHTML = `<div class="loading-weeks">No summaries yet.</div>`;
+        if (allWeeks.length === 0) {
+            summaryEl.innerHTML = '<div class="empty-state"><p>No summaries yet.</p></div>';
             return;
         }
 
-        renderWeekList();
+        // Pre-load all summary files
+        await Promise.all(allWeeks.map(loadSummary));
 
-        // Auto-select from URL hash or latest
-        const hash = window.location.hash.replace("#", "");
-        const target = weeks.find((w) => w.week_start === hash) || weeks[0];
-        selectWeek(target.week_start);
+        renderTab(activeTab);
     }
 
-    // ── Sidebar week list ──────────────────────────────────────
-    function renderWeekList() {
-        weekList.innerHTML = "";
-        for (const week of weeks) {
-            const btn = document.createElement("button");
-            btn.className = "week-item";
-            btn.dataset.week = week.week_start;
-            btn.innerHTML = `
-                <span class="week-date">${formatDateRange(week.week_start, week.week_end)}</span>
-                <span class="week-note-count">${week.note_count} meeting${week.note_count !== 1 ? "s" : ""} analyzed</span>
-            `;
-            btn.addEventListener("click", () => selectWeek(week.week_start));
-            weekList.appendChild(btn);
-        }
-    }
-
-    // ── Select & render a week ────────────────────────────────
-    async function selectWeek(weekStart) {
-        // Update sidebar active state
-        weekList.querySelectorAll(".week-item").forEach((el) => {
-            el.classList.toggle("active", el.dataset.week === weekStart);
-        });
-
-        window.location.hash = weekStart;
-        closeSidebar();
-
-        const week = weeks.find((w) => w.week_start === weekStart);
-        if (!week) return;
-
-        // Update header
-        headerMeta.innerHTML = `
-            <strong>${formatDateRange(week.week_start, week.week_end)}</strong>
-            &nbsp;&middot;&nbsp; ${week.note_count} meetings
-            &nbsp;&middot;&nbsp; Generated ${formatDate(week.generated_at)}
-        `;
-
-        // Load the summary file
-        summaryEl.innerHTML = `<div class="loading-weeks" style="padding:40px 0">Loading summary...</div>`;
-
+    async function loadSummary(week) {
         try {
-            const resp = await fetch(`summaries/${week.file}`);
-            if (!resp.ok) throw new Error(`${resp.status}`);
-            const data = await resp.json();
-            renderSummary(data, week);
+            const resp = await fetch("summaries/" + week.file);
+            if (!resp.ok) throw new Error(resp.status);
+            allSummaries[week.week_start] = await resp.json();
         } catch (e) {
-            summaryEl.innerHTML = `<div class="empty-state"><p>Could not load summary for this week.</p></div>`;
+            // skip failed loads
         }
     }
 
-    // ── Render a summary ──────────────────────────────────────
-    function renderSummary(data, week) {
+    // ── Tab Switching ──────────────────────────────────────────
+    function onTabClick(e) {
+        const btn = e.target.closest(".tab");
+        if (!btn) return;
+        const tab = btn.dataset.tab;
+        if (tab === activeTab) return;
+
+        activeTab = tab;
+        tabBar.querySelectorAll(".tab").forEach(
+            (t) => t.classList.toggle("active", t.dataset.tab === tab)
+        );
+        renderTab(tab);
+    }
+
+    // ── Render a Tab ───────────────────────────────────────────
+    function renderTab(tab) {
+        const days = parseInt(tab, 10);
+        const cutoff = new Date();
+        cutoff.setDate(cutoff.getDate() - days);
+
+        // Filter weeks that overlap with the window
+        const weeksInRange = allWeeks.filter((w) => new Date(w.week_end) >= cutoff);
+
+        if (weeksInRange.length === 0) {
+            summaryEl.innerHTML = '<div class="empty-state"><p>No data for this period yet.</p></div>';
+            headerMeta.textContent = "No data available";
+            return;
+        }
+
+        // Collect all parsed sections from matching weeks
+        const merged = {
+            insights: [],
+            quotes: [],
+            themes: [],
+            frictions: [],
+            ideas: [],
+            noteCount: 0,
+            meetingCount: 0,
+        };
+
+        for (const week of weeksInRange) {
+            const data = allSummaries[week.week_start];
+            if (!data) continue;
+
+            merged.noteCount += week.note_count || 0;
+
+            const sections = parseSummary(data.summary_markdown || data.raw_summary || "");
+            merged.insights.push(...sections.insights);
+            merged.quotes.push(...sections.quotes);
+            merged.themes.push(...sections.themes);
+            merged.frictions.push(...sections.frictions);
+            merged.ideas.push(...sections.ideas);
+        }
+
+        // Date range label
+        const rangeStart = weeksInRange[weeksInRange.length - 1].week_start;
+        const rangeEnd = weeksInRange[0].week_end;
+
+        headerMeta.innerHTML =
+            "<strong>" + formatDateRange(rangeStart, rangeEnd) + "</strong>" +
+            " &middot; " + merged.noteCount + " meetings analyzed";
+
+        // Build HTML
         const html = [];
 
         // Stats bar
-        html.push(`<div class="stats-bar">`);
-        html.push(stat(week.note_count, "Meetings"));
-        if (data.theme_count) html.push(stat(data.theme_count, "Themes"));
-        if (data.friction_count) html.push(stat(data.friction_count, "Friction Points"));
-        if (data.idea_count) html.push(stat(data.idea_count, "Content Ideas"));
-        html.push(`</div>`);
+        html.push('<div class="stats-bar">');
+        html.push(stat(merged.noteCount, "Meetings"));
+        html.push(stat(merged.themes.length, "Themes"));
+        html.push(stat(merged.frictions.length, "Friction Points"));
+        html.push(stat(merged.ideas.length, "Content Ideas"));
+        html.push("</div>");
 
-        // If we have structured markdown, render it
-        if (data.summary_markdown) {
-            html.push(`<div class="markdown-content">${renderMarkdown(data.summary_markdown)}</div>`);
+        // Date range
+        html.push('<div class="date-range-banner">Covering ' + formatDateRange(rangeStart, rangeEnd) + "</div>");
+
+        // 1. Insights
+        if (merged.insights.length > 0) {
+            html.push('<div class="section">');
+            html.push('<h2 class="section-title">Insights</h2>');
+            for (const item of merged.insights) {
+                html.push('<div class="card card--insight"><div class="card-body">' + escapeHtml(item) + "</div></div>");
+            }
+            html.push("</div>");
         }
 
-        // If we have raw_summary (plain text fallback), render it as markdown too
-        if (!data.summary_markdown && data.raw_summary) {
-            html.push(`<div class="markdown-content">${renderMarkdown(data.raw_summary)}</div>`);
+        // 2. Sources (quotes)
+        if (merged.quotes.length > 0) {
+            html.push('<div class="section">');
+            html.push('<h2 class="section-title">Sources</h2>');
+            for (const q of merged.quotes) {
+                html.push('<div class="card card--quote">');
+                html.push('<div class="quote-text">"' + escapeHtml(q.text) + '"</div>');
+                html.push('<div class="quote-attribution">' + escapeHtml(q.attribution));
+                if (q.org) {
+                    html.push(' <span class="quote-org">&mdash; ' + escapeHtml(q.org) + "</span>");
+                }
+                html.push("</div></div>");
+            }
+            html.push("</div>");
+        }
+
+        // 3. Themes
+        if (merged.themes.length > 0) {
+            html.push('<div class="section">');
+            html.push('<h2 class="section-title">Themes</h2>');
+            for (const t of merged.themes) {
+                html.push('<div class="card card--theme">');
+                html.push('<div class="card-title">' + escapeHtml(t.title) + "</div>");
+                html.push('<div class="card-body">' + escapeHtml(t.body) + "</div>");
+                if (t.mentions) {
+                    html.push('<div class="card-meta">Mentioned by: ' + escapeHtml(t.mentions) + "</div>");
+                }
+                html.push("</div>");
+            }
+            html.push("</div>");
+        }
+
+        // 4. Friction Points
+        if (merged.frictions.length > 0) {
+            html.push('<div class="section">');
+            html.push('<h2 class="section-title">Friction Points</h2>');
+            for (const f of merged.frictions) {
+                html.push('<div class="card card--friction">');
+                html.push('<div class="card-title">' + escapeHtml(f.title) + "</div>");
+                html.push('<div class="card-body">' + escapeHtml(f.body) + "</div>");
+                html.push("</div>");
+            }
+            html.push("</div>");
+        }
+
+        // 5. Content Ideas
+        if (merged.ideas.length > 0) {
+            html.push('<div class="section">');
+            html.push('<h2 class="section-title">Content Ideas</h2>');
+            for (const idea of merged.ideas) {
+                html.push('<div class="card card--idea">');
+                html.push('<div class="card-title">' + escapeHtml(idea.title) + "</div>");
+                html.push('<div class="card-body">' + escapeHtml(idea.body) + "</div>");
+                html.push("</div>");
+            }
+            html.push("</div>");
         }
 
         summaryEl.innerHTML = html.join("");
     }
 
-    // ── Minimal Markdown → HTML renderer ──────────────────────
-    function renderMarkdown(md) {
-        let html = md
-            // Escape HTML
-            .replace(/&/g, "&amp;")
-            .replace(/</g, "&lt;")
-            .replace(/>/g, "&gt;");
+    // ── Parse summary markdown into structured sections ────────
+    function parseSummary(md) {
+        const result = {
+            insights: [],
+            quotes: [],
+            themes: [],
+            frictions: [],
+            ideas: [],
+        };
 
-        // Headings
-        html = html.replace(/^### (.+)$/gm, "<h3>$1</h3>");
-        html = html.replace(/^## (.+)$/gm, "<h2>$1</h2>");
-        html = html.replace(/^# (.+)$/gm, "<h1>$1</h1>");
+        // Split into heading-delimited sections
+        var sections = md.split(/^## \d+\.\s*/m);
 
-        // Horizontal rules
-        html = html.replace(/^---$/gm, "<hr>");
+        for (var i = 0; i < sections.length; i++) {
+            var section = sections[i].trim();
+            if (!section) continue;
 
-        // Bold & italic
-        html = html.replace(/\*\*\*(.+?)\*\*\*/g, "<strong><em>$1</em></strong>");
-        html = html.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
-        html = html.replace(/\*(.+?)\*/g, "<em>$1</em>");
+            var firstLine = section.split("\n")[0].toLowerCase();
+            var body = section.substring(section.indexOf("\n") + 1).trim();
 
-        // Inline code
-        html = html.replace(/`([^`]+)`/g, "<code>$1</code>");
-
-        // Blockquotes (consecutive lines)
-        html = html.replace(
-            /(?:^&gt; .+\n?)+/gm,
-            (match) => {
-                const inner = match.replace(/^&gt; /gm, "").trim();
-                return `<blockquote>${inner}</blockquote>\n`;
-            }
-        );
-
-        // Unordered lists
-        html = html.replace(
-            /(?:^- .+\n?)+/gm,
-            (match) => {
-                const items = match
-                    .trim()
-                    .split("\n")
-                    .map((l) => `<li>${l.replace(/^- /, "")}</li>`)
-                    .join("");
-                return `<ul>${items}</ul>\n`;
-            }
-        );
-
-        // Ordered lists
-        html = html.replace(
-            /(?:^\d+\. .+\n?)+/gm,
-            (match) => {
-                const items = match
-                    .trim()
-                    .split("\n")
-                    .map((l) => `<li>${l.replace(/^\d+\. /, "")}</li>`)
-                    .join("");
-                return `<ol>${items}</ol>\n`;
-            }
-        );
-
-        // Paragraphs: wrap remaining loose text lines
-        html = html
-            .split("\n\n")
-            .map((block) => {
-                block = block.trim();
-                if (!block) return "";
-                if (
-                    block.startsWith("<h") ||
-                    block.startsWith("<ul") ||
-                    block.startsWith("<ol") ||
-                    block.startsWith("<blockquote") ||
-                    block.startsWith("<hr")
-                ) {
-                    return block;
+            if (firstLine.indexOf("executive summary") !== -1 || firstLine.indexOf("insight") !== -1) {
+                // Split executive summary into individual sentences/insights
+                var paragraphs = body.split("\n\n").filter(Boolean);
+                for (var j = 0; j < paragraphs.length; j++) {
+                    var p = paragraphs[j].trim();
+                    if (p) result.insights.push(p);
                 }
-                return `<p>${block.replace(/\n/g, "<br>")}</p>`;
-            })
-            .join("\n");
+            } else if (firstLine.indexOf("notable quotes") !== -1 || firstLine.indexOf("source") !== -1) {
+                result.quotes = parseQuotes(body);
+            } else if (firstLine.indexOf("main themes") !== -1 || firstLine.indexOf("theme") !== -1) {
+                result.themes = parseBulletCards(body);
+            } else if (firstLine.indexOf("misunderstanding") !== -1 || firstLine.indexOf("friction") !== -1) {
+                result.frictions = parseFrictionCards(body);
+            } else if (firstLine.indexOf("content idea") !== -1) {
+                result.ideas = parseIdeaCards(body);
+            }
+        }
 
-        return html;
+        return result;
+    }
+
+    // ── Parse quotes: "> quote text" — Attribution ────────────
+    function parseQuotes(text) {
+        var quotes = [];
+        // Match blockquote lines: > "quote text" — Attribution
+        var regex = />\s*"([^"]+)"\s*(?:—|--|-)\s*(.+)/g;
+        var match;
+        while ((match = regex.exec(text)) !== null) {
+            var quoteText = match[1].trim();
+            var attr = match[2].trim();
+            // Try to split "person, org" or "role — org" patterns
+            var org = "";
+            var person = attr;
+            // Check for "team member" or "team" patterns
+            var teamMatch = attr.match(/^(.+?)\s+(?:team\s+member|team)\s*$/i);
+            if (teamMatch) {
+                person = attr;
+                org = teamMatch[1];
+            }
+            // Check for comma-separated: "Name, Org"
+            var commaMatch = attr.match(/^(.+?),\s*(.+)$/);
+            if (commaMatch) {
+                person = commaMatch[1];
+                org = commaMatch[2];
+            }
+            quotes.push({ text: quoteText, attribution: person, org: org });
+        }
+        return quotes;
+    }
+
+    // ── Parse bullet-point cards with bold titles ─────────────
+    function parseBulletCards(text) {
+        var cards = [];
+        // Match lines like: - **Title** — description. Mentioned by: X, Y.
+        var lines = text.split("\n- ");
+        for (var i = 0; i < lines.length; i++) {
+            var line = lines[i].replace(/^-\s*/, "").trim();
+            if (!line) continue;
+            var titleMatch = line.match(/^\*\*(.+?)\*\*\s*(?:—|--|-|:)\s*/);
+            if (titleMatch) {
+                var title = titleMatch[1];
+                var rest = line.substring(titleMatch[0].length).trim();
+                var mentions = "";
+                var mentionMatch = rest.match(/Mentioned by:\s*(.+?)\.?\s*$/i);
+                if (mentionMatch) {
+                    mentions = mentionMatch[1];
+                    rest = rest.substring(0, mentionMatch.index).trim();
+                }
+                // Clean trailing period
+                if (rest.endsWith(".")) rest = rest.slice(0, -1);
+                cards.push({ title: title, body: rest, mentions: mentions });
+            } else if (line.length > 10) {
+                cards.push({ title: "", body: line, mentions: "" });
+            }
+        }
+        return cards;
+    }
+
+    // ── Parse friction points: **Title** — body ──────────────
+    function parseFrictionCards(text) {
+        var cards = [];
+        // Split on bold-titled paragraphs
+        var parts = text.split(/\n(?=- \*\*)/);
+        for (var i = 0; i < parts.length; i++) {
+            var part = parts[i].trim().replace(/^-\s*/, "");
+            if (!part) continue;
+            var titleMatch = part.match(/^\*\*(.+?)\*\*\s*(?:—|--|-|:)\s*/);
+            if (titleMatch) {
+                var title = titleMatch[1];
+                var body = part.substring(titleMatch[0].length).trim();
+                cards.push({ title: title, body: body });
+            } else if (part.length > 10) {
+                cards.push({ title: "", body: part });
+            }
+        }
+        return cards;
+    }
+
+    // ── Parse content ideas: **Title** — body ────────────────
+    function parseIdeaCards(text) {
+        var cards = [];
+        var lines = text.split("\n- ");
+        for (var i = 0; i < lines.length; i++) {
+            var line = lines[i].replace(/^-\s*/, "").trim();
+            if (!line) continue;
+            var titleMatch = line.match(/^\*\*(.+?)\*\*\s*(?:—|--|-|:)\s*/);
+            if (titleMatch) {
+                var title = titleMatch[1];
+                var body = line.substring(titleMatch[0].length).trim();
+                cards.push({ title: title, body: body });
+            } else if (line.length > 10) {
+                cards.push({ title: "", body: line });
+            }
+        }
+        return cards;
     }
 
     // ── Helpers ───────────────────────────────────────────────
     function stat(value, label) {
-        return `<div class="stat"><span class="stat-value">${value}</span><span class="stat-label">${label}</span></div>`;
+        return '<div class="stat"><span class="stat-value">' + value + '</span><span class="stat-label">' + label + "</span></div>";
+    }
+
+    function escapeHtml(str) {
+        return str
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;");
     }
 
     function formatDateRange(start, end) {
-        const s = new Date(start + "T00:00:00");
-        const e = new Date(end + "T00:00:00");
-        const opts = { month: "short", day: "numeric" };
-        const startStr = s.toLocaleDateString("en-US", opts);
-        const endStr = e.toLocaleDateString("en-US", {
-            ...opts,
-            year: "numeric",
-        });
-        return `${startStr} – ${endStr}`;
-    }
-
-    function formatDate(iso) {
-        if (!iso) return "";
-        const d = new Date(iso);
-        return d.toLocaleDateString("en-US", {
-            month: "short",
-            day: "numeric",
-            hour: "numeric",
-            minute: "2-digit",
-        });
-    }
-
-    // ── Mobile sidebar ────────────────────────────────────────
-    function createOverlay() {
-        overlay = document.createElement("div");
-        overlay.className = "sidebar-overlay";
-        overlay.addEventListener("click", closeSidebar);
-        document.body.appendChild(overlay);
-    }
-
-    function toggleSidebar() {
-        sidebar.classList.toggle("open");
-        overlay.classList.toggle("active");
-    }
-
-    function closeSidebar() {
-        sidebar.classList.remove("open");
-        overlay.classList.remove("active");
+        var s = new Date(start + "T00:00:00");
+        var e = new Date(end + "T00:00:00");
+        var opts = { month: "short", day: "numeric" };
+        var startStr = s.toLocaleDateString("en-US", opts);
+        var endStr = e.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+        return startStr + " – " + endStr;
     }
 
     // ── Go ────────────────────────────────────────────────────
